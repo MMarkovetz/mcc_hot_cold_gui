@@ -3,6 +3,8 @@ numpy>=1.24
 matplotlib>=3.7
 pydicom>=2.4           # DICOM I/O (replaces dicominfo/dicomread)
 scipy>=1.11            # .mat file loading + signal/stats/optimize (Signal + Curve Fitting + Stats toolboxes)
+openpyxl>=3.1          # Export Data button: write .xlsx scan-data files
+Pillow>=10.0           # Export Data button: write TIFF mask images (matplotlib already needs PIL anyway)
 # Optional - install if your saved ROI is a MATLAB v7.3 (HDF5) .mat file:
 # h5py>=3.10
 # Optional - install if you hit "DICOM could not decode pixel data":

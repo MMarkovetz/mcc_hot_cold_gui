@@ -341,6 +341,213 @@ class DraggablePolygon:
         self._drag_offset = None
 
 
+class ManualROIDialog(QMainWindow):
+    """Modal-ish popup that lets the user adjust the polygon for one MCC
+    frame.  Blocks via a Qt event loop until the user clicks "Next Frame"
+    (commit) or "Cancel" (abort entire manual run).
+
+    Returns the new Nx2 vertex array via .result_vertices, or None if the
+    user cancelled.
+    """
+
+    def __init__(self, frame_2d, init_vertices, frame_index, n_frames,
+                 parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Manual ROI - frame {frame_index + 1} / {n_frames}")
+        self.resize(640, 720)
+        from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
+                                       QPushButton, QLabel)
+
+        self.result_vertices = None
+        self._cancelled = False
+
+        central = QWidget(self); self.setCentralWidget(central)
+        v = QVBoxLayout(central)
+
+        # Canvas with the frame image.
+        self._figure = Figure(tight_layout=True)
+        self._canvas = FigureCanvas(self._figure)
+        self._ax = self._figure.add_subplot(111)
+        self._ax.imshow(np.asarray(frame_2d, dtype=float), cmap="gray")
+        self._ax.set_xticks([]); self._ax.set_yticks([])
+        v.addWidget(self._canvas, 1)
+
+        # Wrap the matplotlib canvas in a tiny shim so DraggablePolygon
+        # (which expects a UIAxesCanvas-like object with .ax) is happy.
+        class _Shim:
+            def __init__(s, canvas, ax):
+                s.canvas = canvas; s.ax = ax
+            def mpl_connect(s, *a, **kw):
+                return s.canvas.mpl_connect(*a, **kw)
+            def mpl_disconnect(s, *a, **kw):
+                return s.canvas.mpl_disconnect(*a, **kw)
+            def draw_idle(s):
+                s.canvas.draw_idle()
+        shim = _Shim(self._canvas, self._ax)
+        self._editor = DraggablePolygon(shim, init_vertices)
+
+        # Hint label.
+        v.addWidget(QLabel(
+            "Drag any vertex to reshape.  Drag inside to translate.  "
+            "Right-click a vertex to delete.  Double-click an edge to insert."))
+
+        # Buttons.
+        row = QHBoxLayout()
+        next_btn = QPushButton("Next Frame ▶")
+        next_btn.setDefault(True)
+        next_btn.clicked.connect(self._accept)
+        cancel_btn = QPushButton("Cancel manual run")
+        cancel_btn.clicked.connect(self._reject)
+        row.addWidget(cancel_btn)
+        row.addStretch(1)
+        row.addWidget(next_btn)
+        v.addLayout(row)
+
+        self._canvas.draw_idle()
+
+    def _accept(self):
+        self.result_vertices = self._editor.vertices.copy()
+        self.close()
+
+    def _reject(self):
+        self._cancelled = True
+        self.result_vertices = None
+        self.close()
+
+    def exec_modal(self):
+        """Show the window and pump events until it closes."""
+        from PySide6.QtCore import QEventLoop
+        loop = QEventLoop()
+        self.destroyed.connect(loop.quit)
+        # Also break the loop if the window simply closes (no destroyed yet).
+        self._loop_killer = loop
+        self.show()
+        loop.exec()
+        return self.result_vertices, self._cancelled
+
+    def closeEvent(self, event):
+        # Make sure the event loop wakes up.
+        try:
+            self._loop_killer.quit()
+        except Exception:
+            pass
+        super().closeEvent(event)
+
+
+class ScanStackViewer(QMainWindow):
+    """Popup viewer that steps through every frame of an MCC scan stack.
+
+    Optional am_transforms (one per frame i>=1, mapping ref->frame i) and
+    am_centroids (a list of [(x,y),(x,y)] per frame) drive a moving ROI
+    overlay and fiducial markers when Am-241 tracking was used.
+
+    Equivalent to the MATLAB GetMCCButton "ShowScan" block (line 971):
+    the user advances frame-by-frame via Prev/Next buttons, a slider, or
+    the left/right arrow keys.  The polygon ROI is drawn on top of every
+    frame.
+    """
+
+    def __init__(self, stack, polygon_xy, bkg_median=0.0, times=None,
+                 cmap="viridis", parent=None,
+                 am_transforms=None, am_centroids=None):
+        super().__init__(parent)
+        self.setWindowTitle("MCC Scan Stack")
+        self.resize(720, 720)
+        from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
+                                       QPushButton, QSlider, QLabel)
+
+        self._stack = stack
+        self._poly  = np.asarray(polygon_xy, dtype=float)
+        self._bkg   = float(bkg_median)
+        self._n     = int(stack.shape[0])
+        self._am_transforms = am_transforms        # list of 2x3 forward Ms
+        self._am_centroids  = am_centroids         # list of [(x,y),(x,y)] per frame
+        self._times = (np.asarray(times) if times is not None
+                       else np.arange(self._n))
+        self._cmap  = cmap
+
+        central = QWidget(self); self.setCentralWidget(central)
+        v = QVBoxLayout(central)
+
+        self._figure = Figure(tight_layout=True)
+        self._canvas = FigureCanvas(self._figure)
+        self._ax = self._figure.add_subplot(111)
+        v.addWidget(self._canvas, 1)
+
+        ctrl = QHBoxLayout()
+        self._prev_btn  = QPushButton("◀ Prev"); self._prev_btn.clicked.connect(self.prev_frame)
+        self._next_btn  = QPushButton("Next ▶"); self._next_btn.clicked.connect(self.next_frame)
+        self._slider    = QSlider(Qt.Horizontal)
+        self._slider.setRange(0, max(0, self._n - 1))
+        self._slider.valueChanged.connect(self.show_frame)
+        self._label     = QLabel("Frame 0 / 0")
+        ctrl.addWidget(self._prev_btn)
+        ctrl.addWidget(self._slider, 1)
+        ctrl.addWidget(self._next_btn)
+        ctrl.addWidget(self._label)
+        v.addLayout(ctrl)
+
+        self._idx = 0
+        if self._n > 0:
+            self.show_frame(0)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Left:
+            self.prev_frame()
+        elif event.key() == Qt.Key_Right:
+            self.next_frame()
+        else:
+            super().keyPressEvent(event)
+
+    def prev_frame(self):
+        if self._idx > 0:
+            self._slider.setValue(self._idx - 1)
+
+    def next_frame(self):
+        if self._idx < self._n - 1:
+            self._slider.setValue(self._idx + 1)
+
+    def show_frame(self, idx):
+        self._idx = int(idx)
+        frame = self._stack[self._idx]
+        if frame.ndim == 3 and frame.shape[-1] == 1:
+            frame = frame[..., 0]
+        elif frame.ndim == 3:
+            frame = frame.mean(axis=-1)
+        img = np.asarray(frame, dtype=float) - self._bkg
+
+        self._ax.clear()
+        self._ax.imshow(img, cmap=self._cmap)
+
+        # Move the polygon by this frame's Am-241 transform, if available.
+        poly = self._poly
+        if (self._am_transforms is not None and self._idx > 0
+                and self._idx - 1 < len(self._am_transforms)):
+            M = self._am_transforms[self._idx - 1]
+            # Apply M @ [x, y, 1]^T to every vertex.
+            ones = np.ones((poly.shape[0], 1))
+            homog = np.hstack([poly, ones])
+            poly  = (M @ homog.T).T
+        ring = np.vstack([poly, poly[0:1]])
+        self._ax.plot(ring[:, 0], ring[:, 1],
+                      color=(0, 0.447, 0.741), linewidth=2)
+
+        # Show the detected fiducial centroids for this frame, if known.
+        if (self._am_centroids is not None
+                and self._idx < len(self._am_centroids)):
+            for (cx, cy) in self._am_centroids[self._idx]:
+                self._ax.plot(cx, cy, "o", markersize=12,
+                              markerfacecolor="none",
+                              markeredgecolor=(0, 1, 0),
+                              markeredgewidth=2)
+        self._ax.set_xticks([]); self._ax.set_yticks([])
+        t = self._times[self._idx] if self._idx < len(self._times) else self._idx
+        title_t = f"t = {t:g} min" if isinstance(t, (int, float, np.floating)) else f"Frame {self._idx}"
+        self._ax.set_title(f"{title_t}  ({self._idx + 1} / {self._n})")
+        self._label.setText(f"Frame {self._idx + 1} / {self._n}")
+        self._canvas.draw_idle()
+
+
 class MCCHotColdGUI(QMainWindow):
     """Python port of MCC_Hot_Cold_GUI.mlapp."""
 
@@ -1443,6 +1650,356 @@ class MCCHotColdGUI(QMainWindow):
             frame = frame.mean(axis=-1)
         return np.asarray(frame, dtype=float)
 
+    # ---- Am-241 fiducial tracking -----------------------------------
+    @staticmethod
+    def _bpass(image, lnoise=2.0, lobject=5, threshold=0.0):
+        """Crocker-Grier real-space bandpass filter.
+
+        Port of the bpass() helper at MATLAB line 244.  Convolves the
+        image with a Gaussian (lowpass) and a boxcar (the highpass
+        partner) and subtracts to get a bandpass.  Edges zeroed to
+        suppress convolution artifacts.  Used to locate Am-241 spots.
+        """
+        from scipy.signal import convolve
+        img = np.asarray(image, dtype=float)
+
+        if lnoise == 0:
+            gauss_k = np.array([1.0])
+        else:
+            half = int(np.ceil(5 * lnoise))
+            x = np.arange(-half, half + 1)
+            gauss_k = np.exp(-(x / (2.0 * lnoise)) ** 2)
+            gauss_k = gauss_k / gauss_k.sum()
+
+        if lobject:
+            half = int(round(lobject))
+            x = np.arange(-half, half + 1)
+            box_k = np.ones_like(x, dtype=float)
+            box_k = box_k / box_k.sum()
+
+        # Separable 2-D convolution: rows, then columns.
+        gconv = convolve(img, gauss_k[None, :], mode="same")
+        gconv = convolve(gconv, gauss_k[:, None], mode="same")
+
+        if lobject:
+            bconv = convolve(img, box_k[None, :], mode="same")
+            bconv = convolve(bconv, box_k[:, None], mode="same")
+            filtered = gconv - bconv
+        else:
+            filtered = gconv
+
+        lzero = int(max(lobject, int(np.ceil(5 * lnoise))))
+        if lzero > 0:
+            filtered[:lzero, :] = 0
+            filtered[-lzero:, :] = 0
+            filtered[:, :lzero] = 0
+            filtered[:, -lzero:] = 0
+        filtered[filtered < threshold] = 0
+        return filtered
+
+    @staticmethod
+    def _centroids_from_binary(binary_mask):
+        """Return list of (x, y) centroids for every connected component."""
+        labeled, n = ndi.label(np.asarray(binary_mask) > 0)
+        if n == 0:
+            return []
+        coms = ndi.center_of_mass(np.ones_like(labeled, dtype=float),
+                                   labeled, range(1, n + 1))
+        # scipy.ndimage returns (row, col) = (y, x); MATLAB regionprops
+        # gives (Centroid.x, Centroid.y).  Swap.
+        return [(float(c[1]), float(c[0])) for c in coms]
+
+    @staticmethod
+    def _similarity_2d_from_pairs(src_pts, dst_pts):
+        """Closed-form 2-D similarity transform from at least 2 point pairs.
+
+        Returns a 2x3 forward matrix M such that  dst = M @ [x, y, 1]^T.
+        With exactly 2 pairs this reproduces estgeotform2d(...,'similarity').
+        """
+        src = np.asarray(src_pts, dtype=float)
+        dst = np.asarray(dst_pts, dtype=float)
+        if src.shape[0] < 2 or dst.shape[0] < 2:
+            return np.array([[1.0, 0.0, 0.0],
+                             [0.0, 1.0, 0.0]])
+        dx = src[1, 0] - src[0, 0]
+        dy = src[1, 1] - src[0, 1]
+        du = dst[1, 0] - dst[0, 0]
+        dv = dst[1, 1] - dst[0, 1]
+        denom = dx * dx + dy * dy
+        if denom == 0:
+            return np.array([[1.0, 0.0, 0.0],
+                             [0.0, 1.0, 0.0]])
+        # Similarity = complex multiply: (a + ib) * (x + iy) + (tx + i*ty).
+        a = (du * dx + dv * dy) / denom
+        b = (dv * dx - du * dy) / denom
+        tx = dst[0, 0] - (a * src[0, 0] - b * src[0, 1])
+        ty = dst[0, 1] - (b * src[0, 0] + a * src[0, 1])
+        return np.array([[a, -b, tx],
+                         [b,  a, ty]])
+
+    @staticmethod
+    def _warp_image(image, M_2x3, output_shape=None, order=1):
+        """Forward-affine an image; like MATLAB imwarp + imref2d."""
+        if ndi is None:
+            return np.asarray(image, dtype=float)
+        if output_shape is None:
+            output_shape = image.shape[:2]
+        Mf = np.eye(3); Mf[:2, :] = M_2x3
+        Mi = np.linalg.inv(Mf)
+        S = np.array([[0, 1, 0],
+                      [1, 0, 0],
+                      [0, 0, 1]], dtype=float)
+        Mi_rc = S @ Mi @ S
+        return ndi.affine_transform(
+            np.asarray(image, dtype=float),
+            Mi_rc[:2, :2], offset=Mi_rc[:2, 2],
+            order=order, mode="constant", cval=0.0,
+            output_shape=output_shape)
+
+    @staticmethod
+    def _invert_2x3(M):
+        Mf = np.eye(3); Mf[:2, :] = M
+        Mi = np.linalg.inv(Mf)
+        return Mi[:2, :]
+
+    def _get_americium_transforms(self):
+        """Port of getAmericiumTransforms (MATLAB line 347).
+
+        Returns (transforms, good_idxs) where:
+          transforms[i] is the 2x3 forward similarity transform applied
+              to RLmask BEFORE evaluating frame i+1.  Length = n_am-1.
+          good_idxs is a list of 1-based frame indices (matching MATLAB)
+              where exactly 2 fiducial centroids were detected.
+        """
+        if pydicom is None:
+            raise RuntimeError("pydicom is required for Am-241 tracking.")
+
+        # Look for *clearance_Am.dcm next to the SubDir, else prompt.
+        am_path = ""
+        if self.SubDir:
+            matches = sorted(Path(self.SubDir).glob("*clearance_Am.dcm"))
+            if matches:
+                am_path = str(matches[0])
+        if not am_path:
+            am_path, _ = QFileDialog.getOpenFileName(
+                self, "Select Am-241 fiducial stack",
+                self._start_dir(),
+                "DICOM (*.dcm);;All files (*)")
+            if not am_path:
+                raise RuntimeError(
+                    "Am-241 tracking requires a fiducial DICOM stack "
+                    "(usually named *clearance_Am.dcm).")
+
+        arr4d, n_frames_am, _samples = self._read_dicom(am_path)
+        # arr4d: (frames, H, W, C)
+        n_am = int(arr4d.shape[0])
+
+        # ---- Auto-calibrate the threshold on frame 1 ----------------
+        # MATLAB hard-codes "bpim > 0.45", which works on their specific
+        # DICOM intensity scale.  pydicom returns raw uint16, so the
+        # absolute value of 0.45 is meaningless here.  We find the 2
+        # reference fiducial peaks on frame 1, then set the threshold to
+        # a fraction of the DIMMER peak so it still captures both spots
+        # on subsequent frames while rejecting noise / motion fragments.
+        first = self._scan_stack_frame_2d(arr4d, 0)
+        bp1 = self._bpass(first, 2.0, 5)
+        from scipy.ndimage import maximum_filter
+        NMS_WIN = 9
+        nms = maximum_filter(bp1, size=NMS_WIN)
+        peaks = (bp1 == nms) & (bp1 > 0)
+        ys, xs = np.where(peaks)
+        if len(xs) < 2:
+            raise RuntimeError(
+                "Bandpass output of frame 1 has fewer than 2 local maxima. "
+                "Cannot calibrate Am-241 threshold.")
+        intens = bp1[peaks]
+        top2 = np.sort(intens)[::-1][:2]
+        # Threshold = the configured fraction of the DIMMER reference peak.
+        # 0.5 is conservative: captures both spots on frame 1 even if one
+        # is dimmer, but still well above noise.
+        THRESH_FRAC = 0.5
+        threshold = float(top2.min()) * THRESH_FRAC
+        self._am_threshold = threshold
+        self._am_calibration_peaks = (float(top2[0]), float(top2[1]))
+
+        def _detect(frame_2d):
+            """Return centroids of every connected component above threshold.
+
+            Returning ALL connected components is INTENTIONAL: when a
+            patient moves during exposure the fiducial smears into >2
+            blobs, and we want to reject those frames downstream.
+            """
+            bp = self._bpass(frame_2d, 2.0, 5)
+            return self._centroids_from_binary(bp > threshold)
+
+        # Frame 1 - must have exactly 2 centroids by construction.
+        cs = _detect(first)
+        if len(cs) != 2:
+            raise RuntimeError(
+                "Calibration produced {} components on frame 1 (need 2). "
+                "Try a different fiducial stack or lower the threshold "
+                "fraction.".format(len(cs)))
+        # MATLAB y-flip: put the BOTTOM (larger y) point first.
+        cs = sorted(cs, key=lambda p: -p[1])
+        ctrda = np.array(cs, dtype=float)
+
+        per_frame_centroids = [cs]
+        per_frame_n = [2]
+        transforms = []
+        good_idxs = [1]
+        bad_frames = []
+
+        for i in range(1, n_am):
+            frame = self._scan_stack_frame_2d(arr4d, i)
+            cs = _detect(frame)
+            per_frame_n.append(len(cs))
+            if len(cs) == 2:
+                cs = sorted(cs, key=lambda p: -p[1])
+                old_cs = ctrda.copy()
+                new = np.array(cs, dtype=float)
+                ctrda = new
+                M = self._similarity_2d_from_pairs(old_cs, new)
+                good_idxs.append(i + 1)
+                per_frame_centroids.append(cs)
+            else:
+                # ANY other count (0, 1, 3+) -> motion or detection
+                # failure. Reuse the previous transform, exclude this
+                # frame from the retention curve.
+                M = self._similarity_2d_from_pairs(ctrda, ctrda)
+                per_frame_centroids.append(per_frame_centroids[-1])
+                bad_frames.append((i + 1, len(cs)))
+            transforms.append(M)
+
+        # Stash everything for the debug popup and the viewer.
+        self._am_centroids = per_frame_centroids
+        self._am_per_frame_n = per_frame_n
+        self._am_first_frame = first
+        self._am_bpass_first = bp1
+        self._am_bad_frames = bad_frames
+
+        return transforms, good_idxs
+
+    @staticmethod
+    def _affine_from_points(src_xy, dst_xy):
+        """Fit a 2-D affine transform that maps src points to dst points.
+
+        Returns a 2x3 matrix M such that  [M | [t_x; t_y]] @ [x, y, 1]^T = [x'; y'].
+        Solves the least-squares system across all point pairs.
+        """
+        src = np.asarray(src_xy, dtype=float)
+        dst = np.asarray(dst_xy, dtype=float)
+        n = min(src.shape[0], dst.shape[0])
+        if n < 3:
+            return np.array([[1.0, 0.0, 0.0],
+                             [0.0, 1.0, 0.0]])
+        A = np.zeros((2 * n, 6))
+        b = np.zeros(2 * n)
+        for i in range(n):
+            x, y = src[i]
+            xp, yp = dst[i]
+            A[2 * i,     :] = [x, y, 1, 0, 0, 0]
+            A[2 * i + 1, :] = [0, 0, 0, x, y, 1]
+            b[2 * i]     = xp
+            b[2 * i + 1] = yp
+        params, *_ = np.linalg.lstsq(A, b, rcond=None)
+        return params.reshape(2, 3)
+
+    @staticmethod
+    def _warp_mask(mask, M_2x3):
+        """Apply an affine transform to a binary mask.
+
+        M_2x3 maps src->dst in image-coordinate space (column = x, row = y).
+        scipy.ndimage.affine_transform expects the INVERSE mapping
+        (output -> input) in matrix-coordinate space (row, col), so we
+        invert and swap axes.
+        """
+        if ndi is None:
+            return mask.copy()
+        # Build the 3x3 forward matrix.
+        Mf = np.eye(3)
+        Mf[:2, :] = M_2x3
+        Mi = np.linalg.inv(Mf)
+        # scipy expects (row, col) ordering. Swap x<->y rows AND columns.
+        S = np.array([[0, 1, 0],
+                      [1, 0, 0],
+                      [0, 0, 1]], dtype=float)
+        Mi_rc = S @ Mi @ S
+        warped = ndi.affine_transform(
+            mask.astype(float), Mi_rc[:2, :2], offset=Mi_rc[:2, 2],
+            order=0, mode="constant", cval=0.0,
+            output_shape=mask.shape)
+        return warped > 0.5
+
+
+    def _show_am_debug_popup(self):
+        """Pop a window showing the Am-241 frame 1 detection so the user
+        can verify the algorithm is finding the right spots.
+
+        Also shows the per-frame fiducial count so motion-blurred frames
+        (count != 2) are visible at a glance.
+        """
+        if (not hasattr(self, "_am_first_frame")
+                or self._am_first_frame is None):
+            return
+        frame = self._am_first_frame
+        bp    = getattr(self, "_am_bpass_first", None)
+        cs    = self._am_centroids[0] if self._am_centroids else []
+        thr   = getattr(self, "_am_threshold", None)
+        cal   = getattr(self, "_am_calibration_peaks", None)
+        nseq  = getattr(self, "_am_per_frame_n", None)
+        bad   = getattr(self, "_am_bad_frames", []) or []
+
+        win = FigureWindow("Am-241 detection diagnostics",
+                           size=(960, 620))
+        win.figure.clf()
+        ax1 = win.figure.add_subplot(2, 2, 1)
+        ax2 = win.figure.add_subplot(2, 2, 2)
+        ax3 = win.figure.add_subplot(2, 1, 2)
+
+        ax1.imshow(np.asarray(frame, dtype=float), cmap="gray")
+        ax1.set_title("Frame 1: raw + detected centroids")
+        ax2.imshow(np.asarray(bp, dtype=float) if bp is not None
+                    else np.asarray(frame, dtype=float),
+                    cmap="magma")
+        title2 = "Frame 1: bandpass"
+        if thr is not None:
+            title2 += f"  (threshold = {thr:.2f})"
+        ax2.set_title(title2)
+        for (x, y) in cs:
+            for a in (ax1, ax2):
+                a.plot(x, y, "o", markersize=14, markerfacecolor="none",
+                       markeredgecolor=(0, 1, 0), markeredgewidth=2)
+        for a in (ax1, ax2):
+            a.set_xticks([]); a.set_yticks([])
+
+        if nseq is not None:
+            xs_n = np.arange(1, len(nseq) + 1)
+            colors = ["#1f77b4" if n == 2 else "#d62728" for n in nseq]
+            ax3.bar(xs_n, nseq, color=colors)
+            ax3.axhline(2, color="black", linestyle="--", linewidth=1)
+            ax3.set_xlabel("Am-241 frame index (1-based)")
+            ax3.set_ylabel("# blobs above threshold")
+            n_bad = len(bad)
+            n_total = len(nseq)
+            ax3.set_title(
+                f"Per-frame fiducial count   "
+                f"(good = {n_total - n_bad} / {n_total}, "
+                f"rejected = {n_bad})")
+            ax3.set_ylim(0, max(4, max(nseq) + 1))
+        else:
+            ax3.text(0.5, 0.5, "(no per-frame counts available)",
+                     ha="center", va="center")
+            ax3.set_xticks([]); ax3.set_yticks([])
+
+        if cal is not None:
+            win.figure.text(
+                0.01, 0.97,
+                f"Calibration peak intensities: {cal[0]:.2f}, {cal[1]:.2f}    "
+                f"Threshold = 0.5 × min(peaks) = {thr:.2f}",
+                fontsize=9, color="dimgray")
+
+        win.canvas.draw_idle()
+        win.show()
     def GetMCCButtonPushed(self):                      # MATLAB 856
         """Port of MATLAB GetMCCButtonPushed (line 856).
 
@@ -1474,16 +2031,8 @@ class MCCHotColdGUI(QMainWindow):
                 hcd[: len(self.HotColdData)] = self.HotColdData
                 self.HotColdData = hcd
 
-            if self.Am241CheckBox.isChecked():
-                QMessageBox.information(
-                    self, "Not yet ported",
-                    "Am-241 fiducial transforms are not yet implemented; "
-                    "running with identity transforms for every frame.")
-            if self.ManuallyCheckBox.isChecked():
-                QMessageBox.information(
-                    self, "Not yet ported",
-                    "Per-frame manual ROI adjustment is not yet implemented; "
-                    "the same lung ROI will be used for every frame.")
+            manual_mode = self.ManuallyCheckBox.isChecked()
+            manual_cancelled = False
 
             stack = self.MCCstack          # shape (n_frames, H, W, C)
             n_frames = int(stack.shape[0])
@@ -1491,6 +2040,19 @@ class MCCHotColdGUI(QMainWindow):
             if t.size != n_frames:
                 # Trim/pad to match.
                 t = np.resize(t, n_frames)
+            am_transforms = None
+            am_good_idxs = list(range(1, n_frames + 1))
+            if self.Am241CheckBox.isChecked():
+                try:
+                    am_transforms, am_good_idxs = self._get_americium_transforms()
+                    self._show_am_debug_popup()
+                except Exception as exc:
+                    QMessageBox.warning(
+                        self, "Am-241 tracking failed",
+                        "Could not compute Am-241 transforms; falling back "
+                        "to identity. Reason:" + chr(10) + str(exc))
+                    am_transforms = None
+                    am_good_idxs = list(range(1, n_frames + 1))
 
             HALF_LIFE = np.log(2.0) / (6.04 * 60.0)
             bkg_arr = np.asarray(self.BKGim, dtype=float)
@@ -1509,12 +2071,40 @@ class MCCHotColdGUI(QMainWindow):
             idx_60 = int(np.argmin(np.abs(t - 60.0))) if (t == 60.0).any() else None
             idx_90 = int(np.argmin(np.abs(t - 90.0))) if (t == 90.0).any() else None
 
+            cur_rl = rl.copy()
+            cur_cm = cm.copy()
+            cur_pm = pm.copy()
+            og_verts = (np.asarray(self.ROIposition, dtype=float)
+                        if self.ROIposition is not None else None)
+
             for i in range(n_frames):
+                # MATLAB precedence: i==1 OR (not Am241 and not Manual) -> use
+                # the static deposition masks; manual mode overrides; else
+                # use the Am-241 transforms (warps RLmask only - CR/PR stay).
+                if manual_mode and i > 0 and not manual_cancelled and og_verts is not None:
+                    fr_disp = self._scan_stack_frame_2d(stack, i) - bkg_c
+                    dlg = ManualROIDialog(
+                        fr_disp, og_verts, i, n_frames, parent=self)
+                    new_verts, cancelled = dlg.exec_modal()
+                    if cancelled:
+                        manual_cancelled = True
+                    elif new_verts is not None:
+                        M = self._affine_from_points(og_verts, new_verts)
+                        cur_rl = self._warp_mask(rl, M)
+                        cur_cm = self._warp_mask(cm, M)
+                        cur_pm = self._warp_mask(pm, M)
+                elif (am_transforms is not None and i > 0
+                      and i - 1 < len(am_transforms)):
+                    # Am-241: warp ONLY RLmask. MATLAB leaves CR/PR static.
+                    M = am_transforms[i - 1]
+                    cur_rl = self._warp_mask(rl, M)
+                    # cur_cm, cur_pm stay at their previous values.
+
                 fr = self._scan_stack_frame_2d(stack, i)
                 fr_blur = ndi.gaussian_filter(fr, sigma=2)
-                wl_im = fr_blur * rl
-                cr_im = fr_blur * cm
-                pr_im = fr_blur * pm
+                wl_im = fr_blur * cur_rl
+                cr_im = fr_blur * cur_cm
+                pr_im = fr_blur * cur_pm
 
                 base = float(wl_im.sum()) - bkg_c
                 base_c = float(cr_im.sum()) - bkg_c
@@ -1527,16 +2117,34 @@ class MCCHotColdGUI(QMainWindow):
                 if i == 0:
                     mcc_im0 = wl_im.copy()
                 if idx_60 is not None and i == idx_60:
-                    mcc_im60 = ndi.gaussian_filter(fr, sigma=2)
+                    base = ndi.gaussian_filter(fr, sigma=2)
+                    if (am_transforms is not None
+                            and i - 1 < len(am_transforms)):
+                        Mi = self._invert_2x3(am_transforms[i - 1])
+                        base = self._warp_image(base, Mi, output_shape=base.shape)
+                    mcc_im60 = base
                 if idx_90 is not None and i == idx_90:
-                    mcc_im90 = ndi.gaussian_filter(fr, sigma=2)
+                    base = ndi.gaussian_filter(fr, sigma=2)
+                    if (am_transforms is not None
+                            and i - 1 < len(am_transforms)):
+                        Mi = self._invert_2x3(am_transforms[i - 1])
+                        base = self._warp_image(base, Mi, output_shape=base.shape)
+                    mcc_im90 = base
 
             # ---- Retention curve --------------------------------------
             denom = wl_counts[0] if wl_counts[0] != 0 else np.nan
             ret_array = wl_counts / denom
 
             ret_win = FigureWindow("Retention Curve", size=(700, 520))
-            ret_win.ax.plot(t, ret_array, linewidth=2)
+            # Filter to "good" frames (those where Am-241 found 2 centroids).
+            # am_good_idxs is 1-based to match MATLAB; convert to 0-based.
+            good0 = [g - 1 for g in am_good_idxs if 0 <= g - 1 < n_frames]
+            t_plot   = t[good0]   if good0 else t
+            ret_plot = ret_array[good0] if good0 else ret_array
+            ret_win.ax.plot(t_plot, ret_plot, linewidth=2)
+            if len(good0) < n_frames:
+                ret_win.ax.set_title(
+                    f"Retention Curve  ({len(good0)}/{n_frames} good frames)")
             ret_win.ax.set_xlabel("Time (min)")
             ret_win.ax.set_ylabel("Retention")
             ret_win.ax.set_ylim(0, 1.2)
@@ -1652,6 +2260,20 @@ class MCCHotColdGUI(QMainWindow):
             self.AUC90 = float(np.nanmean(sl[:9])) if sl.size >= 9 else np.nan
 
             # ---- Summary popup ---------------------------------------
+            # ---- ShowScan viewer (optional) ---------------------------
+            if self.ShowScanCheckBox.isChecked() and self.ROIposition is not None:
+                am_cs = getattr(self, "_am_centroids", None)
+                viewer = ScanStackViewer(
+                    stack, self.ROIposition,
+                    bkg_median=bkg_c, times=t, cmap="viridis",
+                    am_transforms=am_transforms,
+                    am_centroids=am_cs)
+                _popup_windows.append(viewer)
+                viewer.destroyed.connect(
+                    lambda *_: _popup_windows.remove(viewer)
+                    if viewer in _popup_windows else None)
+                viewer.show()
+
             self.MCCdone = True
             msg_lines = [
                 f"Frames analyzed:   {n_frames}",
@@ -1669,6 +2291,154 @@ class MCCHotColdGUI(QMainWindow):
             QMessageBox.critical(self, "Get MCC error",
                                  f"{e}" + chr(10) + chr(10) + traceback.format_exc())
 
+    # ---- Export Data ------------------------------------------------
+    @staticmethod
+    def _to_uint8_image(arr):
+        """Convert any float / bool / int array into a uint8 image (0..255)."""
+        a = np.asarray(arr)
+        if a.dtype == bool:
+            return (a.astype(np.uint8) * 255)
+        a = a.astype(float)
+        finite = a[np.isfinite(a)]
+        if finite.size == 0:
+            return np.zeros(a.shape, dtype=np.uint8)
+        lo, hi = float(finite.min()), float(finite.max())
+        if hi - lo < 1e-12:
+            return np.zeros(a.shape, dtype=np.uint8)
+        a = np.where(np.isfinite(a), (a - lo) / (hi - lo), 0)
+        return np.clip(a * 255, 0, 255).astype(np.uint8)
+
+    def ExportDataButtonPushed(self):                  # MATLAB 1212
+        """Export masks, polygon ROI, and a multi-section .xlsx of results."""
+        try:
+            try:
+                import openpyxl
+                from openpyxl.utils import get_column_letter
+            except ImportError:
+                raise RuntimeError(
+                    "openpyxl is required to export to .xlsx.\n"
+                    "Run:  pip install openpyxl")
+            try:
+                from PIL import Image
+            except ImportError:
+                raise RuntimeError(
+                    "Pillow is required to write TIFF masks.\n"
+                    "Run:  pip install Pillow")
+            try:
+                import scipy.io as sio
+            except ImportError:
+                sio = None
+
+            if not (self.HCdone or self.MCCdone):
+                QMessageBox.warning(
+                    self, "Nothing to export",
+                    "Run Analyze Depo and/or Get MCC before exporting.")
+                return
+
+            # Pick a destination folder. Default to SubDir, else prompt.
+            sub_dir = self.SubDir
+            if not sub_dir or not Path(sub_dir).is_dir():
+                sub_dir = QFileDialog.getExistingDirectory(
+                    self, "Choose export folder",
+                    str(Path.home()))
+                if not sub_dir:
+                    return
+                self.SubDir = sub_dir
+            sub_dir = Path(sub_dir)
+
+            # ---- TIFF masks --------------------------------------------
+            written = []
+            def _save_tiff(arr, name):
+                if arr is None:
+                    return
+                img = Image.fromarray(self._to_uint8_image(arr))
+                path = sub_dir / name
+                img.save(path, format="TIFF")
+                written.append(str(path))
+
+            _save_tiff(self.HotMask,        "hot_mask.tif")
+            _save_tiff(self.ColdMask,       "cold_mask.tif")
+            _save_tiff(self.RLmask,         "RL_mask.tif")
+            _save_tiff(self.maskedDepoIm,   "depo_masked.tif")
+
+            # ---- patient_roi.mat (plain Nx2 vertices) ------------------
+            if self.ROIposition is not None and sio is not None:
+                verts = np.asarray(self.ROIposition, dtype=float)
+                roi_path = sub_dir / "patient_roi.mat"
+                sio.savemat(
+                    str(roi_path),
+                    {"lung_mask": {"Position": verts},
+                     "vertices":  verts},
+                    do_compression=False, oned_as="row")
+                written.append(str(roi_path))
+
+            # ---- ScanData_wAUC_and_CP_masks.xlsx -----------------------
+            xlsx_path = sub_dir / "ScanData_wAUC_and_CP_masks_py.xlsx"
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "ScanData"
+
+            HC_names  = ["Hot NR", "Cold NR", "Hot SR", "Skew",
+                         "C/P", "FR", "SLR"]
+            MCC_names = ["Time (min)", "% Clearance",
+                         "% Central Clearance", "% Peripheral Clearance"]
+            Thr_names = ["MCC Threshold",
+                         "Fraction Above (t=60)",
+                         "Fraction Above (t=90)"]
+            AUC_names = ["AUC60", "AUC90"]
+
+            def _put(cell, value):
+                if value is None:
+                    return
+                if isinstance(value, (np.floating, np.integer)):
+                    value = value.item()
+                if isinstance(value, float) and not np.isfinite(value):
+                    return
+                ws[cell] = value
+
+            def _row(start_col, row, values):
+                for i, v in enumerate(values):
+                    col = get_column_letter(start_col + i)
+                    _put(f"{col}{row}", v)
+
+            _row(1, 1, HC_names)
+            if self.HotColdData is not None:
+                _row(1, 2, list(np.asarray(self.HotColdData)))
+
+            _row(1, 4, MCC_names)
+            if self.MCCarray is not None:
+                arr = np.asarray(self.MCCarray)
+                for r, vals in enumerate(arr):
+                    _row(1, 5 + r, list(vals))
+
+            _put("I1", Thr_names[0])
+            _put("I2", Thr_names[1])
+            _put("I3", Thr_names[2])
+            if self.FastSlowArray is not None:
+                arr = np.asarray(self.FastSlowArray)
+                _row(10, 1, list(arr[0]))
+                _row(10, 2, list(arr[1]))
+            if self.FastSlowArray90 is not None:
+                _row(10, 3, list(np.asarray(self.FastSlowArray90)))
+
+            _put("I5", AUC_names[0]); _put("J5", AUC_names[1])
+            _put("I6", self.AUC60);   _put("J6", self.AUC90)
+
+            wb.save(str(xlsx_path))
+            written.append(str(xlsx_path))
+
+            QMessageBox.information(
+                self, "Export complete",
+                "Wrote " + str(len(written)) + " file(s) to:" + chr(10)
+                + str(sub_dir) + chr(10) + chr(10)
+                + chr(10).join(Path(p).name for p in written))
+
+        except Exception as e:
+            import traceback
+            QMessageBox.critical(
+                self, "Export error",
+                f"{e}" + chr(10) + chr(10) + traceback.format_exc())
+
     # ---- Stubs - port bodies later from extracted_matlab_code.m ------
     def BKGImageEditFieldValueChanged(self): pass         # MATLAB 478
     def BKGImageEditFieldValueChanging(self, _t): pass    # MATLAB 514
@@ -1683,11 +2453,20 @@ class MCCHotColdGUI(QMainWindow):
     def DilateandFillButtonPushed(self): pass             # MATLAB 659
     def GetsButtonPushed(self): pass                      # MATLAB 669
     # AnalyzeDepoButtonPushed is implemented above (MATLAB 749).
-    # GetMCCButtonPushed implemented below (MATLAB 856).
+    # GetMCCButtonPushed implemented above (MATLAB 856).
     def ShowScanCheckBoxValueChanged(self, _s): pass      # MATLAB 1156
-    def ExportDataButtonPushed(self): pass                # MATLAB 1212
-    def ManuallyCheckBoxValueChanged(self, _s): pass      # MATLAB 1250
-    def Am241CheckBoxValueChanged(self, _s): pass         # MATLAB 1259
+    # ExportDataButtonPushed implemented above (MATLAB 1212).
+
+    def ManuallyCheckBoxValueChanged(self, _s):           # MATLAB 1250
+        """Manually + Am-241 are mutually exclusive (per MATLAB)."""
+        if self.ManuallyCheckBox.isChecked():
+            self.Am241CheckBox.setChecked(False)
+            self.ShowScanCheckBox.setChecked(False)
+
+    def Am241CheckBoxValueChanged(self, _s):              # MATLAB 1259
+        if self.Am241CheckBox.isChecked():
+            self.ManuallyCheckBox.setChecked(False)
+
     def LungROIFileEditFieldValueChanged(self): pass      # MATLAB 1267
     def LungROIFileEditFieldValueChanging(self, _t): pass # MATLAB 1273
 
@@ -1721,4 +2500,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit
+    sys.exit(main())

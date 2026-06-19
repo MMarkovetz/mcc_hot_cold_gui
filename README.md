@@ -30,13 +30,77 @@ Python 3.10 or newer is recommended.
 
 If PySide6 fails to import with `DLL load failed while importing QtCore: The specified procedure could not be found.`, install the Visual C++ 2015-2022 x64 redistributable from <https://aka.ms/vs/17/release/vc_redist.x64.exe> and try again. The `diagnose.bat` script will tell you whether the redistributable is missing.
 
-## Build a single-file Windows .exe
+## Build a shareable single-file Windows .exe
+
+The packaged executable is fully self-contained — recipients do not need Python, the venv, or any of the analysis libraries installed.
+
+From cmd.exe in this folder:
 
 ```bat
 build_exe.bat
 ```
 
-This produces `dist\MCC_Hot_Cold_GUI.exe` (~50-100 MB, bundles Python + PySide6 + matplotlib + numpy + scipy). No Python install is required on target machines.
+From PowerShell in this folder:
+
+```powershell
+.\build_exe.ps1
+```
+
+Either script creates a clean virtual environment, installs `requirements.txt` plus `pyinstaller`, then runs PyInstaller against `MCC_Hot_Cold_GUI.spec`. Expect the build to take about 3 to 8 minutes the first time and produce `dist\MCC_Hot_Cold_GUI.exe` (roughly 200–300 MB; the bulk is PySide6, matplotlib, numpy, scipy, pydicom, openpyxl, and Pillow bundled together).
+
+### What to share with recipients
+
+Just the single `MCC_Hot_Cold_GUI.exe` from the `dist\` folder. Zip it and email or share it however you like — no other files are needed.
+
+### Recipient prerequisites
+
+A 64-bit Windows machine and the Microsoft Visual C++ 2015-2022 x64 redistributable. The redistributable ships with most modern Windows installations, but if a recipient sees `DLL load failed while importing QtCore: The specified procedure could not be found.` on first launch, point them to <https://aka.ms/vs/17/release/vc_redist.x64.exe>.
+
+Recipients do not need a Python installation, do not need to install pip packages, and do not need to clone or download anything else.
+
+### Antivirus / SmartScreen notes
+
+Because PyInstaller-bundled `.exe` files extract a temp directory and load DLLs from it on startup, Windows SmartScreen sometimes shows an "unknown publisher" warning on first launch — recipients click "More info → Run anyway." This is normal for unsigned executables. If you plan to distribute widely, code-sign the `.exe` with an EV certificate; for a small group of collaborators the warning is harmless.
+
+The `build_exe.spec` deliberately disables UPX compression — UPX makes the `.exe` smaller but occasionally triggers heuristic false positives in Windows Defender and other AV scanners. The trade-off is a slightly larger file in exchange for fewer support calls.
+
+### Iterating
+
+After your first build, you can rerun `build_exe.bat` / `build_exe.ps1` to rebuild. The scripts reuse the existing `.venv` (no re-install), so subsequent builds are faster — usually 1 to 3 minutes. Delete `.venv\` if you ever want to start from a clean Python install (e.g. after upgrading dependencies in `requirements.txt`).
+
+## Build a shareable macOS .app
+
+PyInstaller does **not** cross-compile — a macOS `.app` cannot be produced on a Windows or Linux machine. The two practical paths to a Mac build are:
+
+### Path 1: build on any Mac
+
+On the Mac, in this folder, in Terminal:
+
+```bash
+chmod +x build_app.sh    # first time only
+./build_app.sh
+```
+
+The script creates `.venv`, installs `requirements.txt` plus `pyinstaller`, then builds `dist/MCC_Hot_Cold_GUI.app`. Drag the `.app` to `/Applications` to test, or run `open dist/MCC_Hot_Cold_GUI.app` from Terminal. Architecture matches the Mac that built it — an Apple Silicon Mac produces an arm64 `.app`, an Intel Mac produces an x86_64 `.app`.
+
+### Path 2: GitHub Actions (no Mac required)
+
+The repo includes `.github/workflows/build.yml`, which spins up a free macOS runner on every push and produces both Apple Silicon and Intel builds as downloadable artifacts. To use it: push the repo to GitHub, open the **Actions** tab, click the latest workflow run, and download `MCC_Hot_Cold_GUI-macos-arm64` and `MCC_Hot_Cold_GUI-macos-x86_64` from the **Artifacts** section. (The same workflow also produces the Windows `.exe`, so a single push gives you all three platforms.)
+
+### Sharing the `.app`
+
+Zip with the macOS-native tool to preserve extended attributes:
+
+```bash
+cd dist
+ditto -c -k --sequesterRsrc --keepParent MCC_Hot_Cold_GUI.app MCC_Hot_Cold_GUI.app.zip
+```
+
+Send the `.zip`. On a recipient's Mac, double-clicking the unzipped `.app` will trigger Gatekeeper:
+
+> "MCC_Hot_Cold_GUI.app" cannot be opened because the developer cannot be verified.
+
+This is expected for unsigned apps. Have the recipient **right-click (or Control-click) the .app → Open → Open** in the security dialog. This is a one-time approval per Mac. If you plan to share widely or with hospitals/clinics that have stricter security policies, you'll need to code-sign and notarize through Apple — that requires a $99/year Apple Developer account.
 
 ## Basic usage
 
