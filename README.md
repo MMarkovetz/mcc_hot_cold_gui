@@ -87,7 +87,31 @@ The script creates `.venv`, installs `requirements.txt` plus `pyinstaller`, then
 
 The repo includes `.github/workflows/build.yml`, which spins up a free macOS runner on every push and produces both Apple Silicon and Intel builds as downloadable artifacts. To use it: push the repo to GitHub, open the **Actions** tab, click the latest workflow run, and download `MCC_Hot_Cold_GUI-macos-arm64` and `MCC_Hot_Cold_GUI-macos-x86_64` from the **Artifacts** section. (The same workflow also produces the Windows `.exe`, so a single push gives you all three platforms.)
 
-### Sharing the `.app`
+### Distributing via GitHub Releases (recommended for any non-trivial size)
+
+For files too large to attach to email or Slack, GitHub Releases gives you a permanent download URL per file (up to 2 GB each, much larger than the ~300 MB our `.exe` lands at).
+
+The repo's workflow auto-publishes a Release when you push a version tag. From the local clone:
+
+```powershell
+# Bump-and-tag a new version.  Any tag starting with "v" works.
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+That single tag push triggers the Actions workflow to build Windows + both macOS architectures, then attaches the three files to a brand-new Release named `v1.0.0`:
+
+- `MCC_Hot_Cold_GUI-windows.exe`
+- `MCC_Hot_Cold_GUI-macos-arm64.app.zip`
+- `MCC_Hot_Cold_GUI-macos-x86_64.app.zip`
+
+Each file gets a stable URL of the form `https://github.com/USER/mcc_hot_cold_gui/releases/download/v1.0.0/MCC_Hot_Cold_GUI-windows.exe` that you can paste into emails, share over Teams, etc. Recipients click and it downloads in any browser — no GitHub knowledge required.
+
+Release notes are auto-generated from the commit log since the last tag, so it's worth writing descriptive commit messages.
+
+**Privacy caveat for private repos**: release-asset URLs from a *private* repo still require a recipient to sign into a GitHub account that has access to the repo. If your recipients won't have GitHub accounts, you have three options: (a) make the repo public (review the history first to be sure nothing sensitive landed in early commits), (b) host the artifacts on a different file-share like Dropbox/OneDrive, or (c) generate a short-lived signed URL per recipient — there's no built-in GitHub feature for this, so manual file-share is usually simpler.
+
+### Sharing the `.app` (manual, smaller distributions)
 
 Zip with the macOS-native tool to preserve extended attributes:
 

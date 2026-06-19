@@ -1,12 +1,17 @@
 name: Build executables
 
-# Run on every push and pull request, and let you trigger manually from the
-# Actions tab.
+# Run on every push and pull request, on every version tag (those also
+# create a Release with the artifacts attached), and let you trigger
+# manually from the Actions tab.
 on:
   push:
     branches: [ main, master ]
+    tags:    [ 'v*' ]
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: write   # required to create Releases
 
 jobs:
   windows:
@@ -32,7 +37,7 @@ jobs:
 
   macos-arm64:
     name: Build macOS .app (Apple Silicon)
-    runs-on: macos-14   # Apple Silicon runner
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -57,7 +62,7 @@ jobs:
 
   macos-x86_64:
     name: Build macOS .app (Intel)
-    runs-on: macos-13   # Intel x86_64 runner
+    runs-on: macos-13
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -79,3 +84,31 @@ jobs:
           name: MCC_Hot_Cold_GUI-macos-x86_64
           path: dist/MCC_Hot_Cold_GUI-x86_64.app.zip
           retention-days: 30
+
+  release:
+    # Fires only on a "v*" tag push (e.g. v1.0.0, v2024.07.01).
+    # Collects what the three build jobs produced and attaches them to
+    # a GitHub Release for permanent, stable-URL downloads.
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, macos-arm64, macos-x86_64]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Rename files for release
+        run: |
+          mkdir release
+          cp artifacts/MCC_Hot_Cold_GUI-windows/MCC_Hot_Cold_GUI.exe                release/MCC_Hot_Cold_GUI-windows.exe
+          cp artifacts/MCC_Hot_Cold_GUI-macos-arm64/MCC_Hot_Cold_GUI-arm64.app.zip   release/MCC_Hot_Cold_GUI-macos-arm64.app.zip
+          cp artifacts/MCC_Hot_Cold_GUI-macos-x86_64/MCC_Hot_Cold_GUI-x86_64.app.zip release/MCC_Hot_Cold_GUI-macos-x86_64.app.zip
+          ls -la release/
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false
